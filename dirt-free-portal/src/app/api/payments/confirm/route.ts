@@ -1,0 +1,192 @@
+export const dynamic = 'force-dynamic'
+
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { getStripe } from '@/lib/stripe/server'
+import { paymentLimiter } from '@/lib/rate-limit'
+import { logger } from '@/lib/logger'
+import { logPaymentAudit, logAudit } from '@/lib/audit'
+
+/**
+ * Confirm Payment
+ *
+ * Confirms a successful payment and updates invoice status.
+ * Also awards loyalty points (1 point per dollar spent).
+ *
+ * Authentication: Required (Supabase JWT)
+ * Rate Limit: 10 requests per minute per customer
+ *
+ * Request Body:
+ * {
+ *   invoiceId: string,       // UUID of the invoice being paid
+ *   paymentIntentId: string  // Stripe PaymentIntent ID
+ * }
+ *
+ * Response (Success 200):
+ * {
+ *   success: true,
+ *   message: "Payment confirmed and invoice updated",
+ *   invoice: { id, customer_id, amount }
+ * }
+ *
+ * Error Responses:
+ * - 400: Missing required fields
+ * - 400: Payment not successful (PaymentIntent status != 'succeeded')
+ * - 404: Invoice not found
+ * - 429: Too many requests (rate limit exceeded)
+ * - 500: Failed to update invoice / Failed to confirm payment
+ *
+ * Example Usage:
+ * POST /api/payments/confirm
+ * Body: { "invoiceId": "uuid", "paymentIntentId": "pi_xxx" }
+ */
+export async function POST(request: NextRequest) {
+  let invoiceId: string | undefined
+  let paymentIntentId: string | undefined
+
+  try {
+    const body = await request.json()
+    invoiceId = body.invoiceId
+    paymentIntentId = body.paymentIntentId
+
+    if (!invoiceId || !paymentIntentId) {
+      return NextResponse.json(
+        { error: 'Missing required fields' },
+        { status: 400 }
+      )
+    }
+
+    // Verify payment intent was successful
+    const paymentIntent = await getStripe().paymentIntents.retrieve(paymentIntentId)
+
+    if (paymentIntent.status !== 'succeeded') {
+      return NextResponse.json(
+        { error: 'Payment not successful' },
+        { status: 400 }
+      )
+    }
+
+    // Update invoice status in database
+    const supabase = await createClient()
+
+    // Get invoice to extract customer ID for rate limiting
+    const { data: invoiceData } = await supabase
+      .from('invoices')
+      .select('customer_id')
+      .eq('id', invoiceId)
+      .single()
+
+    if (!invoiceData) {
+      return NextResponse.json(
+        { error: 'Invoice not found' },
+        { status: 404 }
+      )
+    }
+
+    // Rate limiting - 10 payment confirmations per minute per customer
+    try {
+      await paymentLimiter.check(10, invoiceData.customer_id)
+    } catch {
+      return NextResponse.json(
+        { error: 'Too many requests. Please try again later.' },
+        { status: 429 }
+      )
+    }
+    const { error: updateError } = await supabase
+      .from('invoices')
+      .update({
+        status: 'paid',
+        paid_date: new Date().toISOString(),
+        stripe_payment_intent_id: paymentIntentId,
+      })
+      .eq('id', invoiceId)
+
+    if (updateError) {
+      logger.error('Failed to update invoice', updateError, {
+        endpoint: '/api/payments/confirm',
+        invoiceId,
+        paymentIntentId,
+      })
+      return NextResponse.json(
+        { error: 'Failed to update invoice' },
+        { status: 500 }
+      )
+    }
+
+    // Get customer info to add loyalty points
+    const { data: invoice } = await supabase
+      .from('invoices')
+      .select('customer_id, amount')
+      .eq('id', invoiceId)
+      .single()
+
+    if (invoice) {
+      // Award loyalty points (1 point per dollar spent)
+      const pointsToAdd = Math.floor(invoice.amount)
+
+      const { data: customer } = await supabase
+        .from('customers')
+        .select('loyalty_points')
+        .eq('id', invoice.customer_id)
+        .single()
+
+      if (customer) {
+        await supabase
+          .from('customers')
+          .update({
+            loyalty_points: (customer.loyalty_points || 0) + pointsToAdd,
+          })
+          .eq('id', invoice.customer_id)
+
+        // Record loyalty transaction
+        await supabase
+          .from('loyalty_transactions')
+          .insert({
+            customer_id: invoice.customer_id,
+            points: pointsToAdd,
+            type: 'earn',
+            description: `Invoice payment #${invoiceId.slice(0, 8)}`,
+          })
+      }
+    }
+
+    // Audit log: invoice paid
+    if (invoice) {
+      await logAudit({
+        userId: invoice.customer_id,
+        action: 'invoice_paid',
+        resourceType: 'invoice',
+        resourceId: invoiceId,
+        details: {
+          amount: invoice.amount,
+          payment_intent_id: paymentIntentId,
+        },
+        request,
+        status: 'success',
+      })
+
+      logger.info('Payment confirmed successfully', {
+        invoiceId,
+        customerId: invoice.customer_id,
+        amount: invoice.amount,
+        paymentIntentId,
+      })
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: 'Payment confirmed and invoice updated',
+      invoice: invoice,
+    })
+  } catch (error) {
+    logger.error('Failed to confirm payment', error as Error, {
+      endpoint: '/api/payments/confirm',
+      invoiceId,
+      paymentIntentId,
+    })
+    return NextResponse.json(
+      { error: 'Failed to confirm payment' },
+      { status: 500 }
+    )
+  }
+}

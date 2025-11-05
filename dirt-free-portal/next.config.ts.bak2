@@ -1,0 +1,140 @@
+import type { NextConfig } from "next";
+import { withSentryConfig } from '@sentry/nextjs'
+
+// Validate environment variables at build time
+import './src/lib/env'
+
+const nextConfig: NextConfig = {
+  // Enable React strict mode for better development experience
+  reactStrictMode: true,
+
+  // Note: SWC minification is now the default in Next.js 15+ (swcMinify option removed)
+
+  // Compiler optimizations
+  compiler: {
+    // Remove console.log in production (keep error and warn)
+    removeConsole: process.env.NODE_ENV === 'production' ? {
+      exclude: ['error', 'warn'],
+    } : false,
+  },
+
+  // Image optimization configuration
+  images: {
+    // Allow images from Supabase storage and external sources
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: '*.supabase.co',
+        pathname: '/storage/v1/object/**',
+      },
+    ],
+    // Use modern image formats for better compression
+    formats: ['image/webp', 'image/avif'],
+    // Device sizes for responsive images
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920, 2048],
+    // Image sizes for different layouts
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384],
+    // Cache optimized images for 60 days
+    minimumCacheTTL: 60 * 60 * 24 * 60,
+  },
+
+  // Serverless function configuration (Vercel deployment)
+  // Applies to all API routes and server-side functions
+  // See: https://nextjs.org/docs/app/api-reference/next-config-js/maxDuration
+  serverExternalPackages: ['stripe'], // Mark Stripe as external to reduce bundle size
+
+  // Experimental optimizations
+  experimental: {
+    // Tree-shake large icon libraries for smaller bundles
+    optimizePackageImports: ['lucide-react', '@radix-ui/react-icons'],
+  },
+
+  // ESLint configuration
+  eslint: {
+    // Allow builds with ESLint warnings (not errors)
+    ignoreDuringBuilds: true,
+  },
+
+  // TypeScript configuration
+  typescript: {
+    // Ignore TypeScript errors during build for staging deployment
+    ignoreBuildErrors: true,  },
+
+  // Security headers and Content Security Policy
+  async headers() {
+    return [
+      {
+        // Apply security headers to all routes
+        source: '/(.*)',
+        headers: [
+          {
+            key: 'X-DNS-Prefetch-Control',
+            value: 'on',
+          },
+          {
+            key: 'Strict-Transport-Security',
+            value: 'max-age=63072000; includeSubDomains; preload',
+          },
+          {
+            key: 'X-Frame-Options',
+            value: 'SAMEORIGIN',
+          },
+          {
+            key: 'X-Content-Type-Options',
+            value: 'nosniff',
+          },
+          {
+            key: 'X-XSS-Protection',
+            value: '1; mode=block',
+          },
+          {
+            key: 'Referrer-Policy',
+            value: 'origin-when-cross-origin',
+          },
+          {
+            key: 'Permissions-Policy',
+            value: 'camera=(), microphone=(), geolocation=()',
+          },
+          {
+            key: 'Content-Security-Policy',
+            value: [
+              "default-src 'self'",
+              "script-src 'self' 'unsafe-eval' 'unsafe-inline' https://js.stripe.com https://www.googletagmanager.com",
+              "style-src 'self' 'unsafe-inline'",
+              "img-src 'self' data: https: blob:",
+              "font-src 'self' data:",
+              "connect-src 'self' https://*.supabase.co https://api.stripe.com https://www.google-analytics.com",
+              "frame-src https://js.stripe.com",
+            ].join('; '),
+          },
+        ],
+      },
+    ]
+  },
+};
+
+// Sentry configuration
+// Only apply Sentry in production or when SENTRY_DSN is set
+const sentryWebpackPluginOptions = {
+  // Upload source maps to Sentry for better error reporting
+  silent: true, // Suppresses source map uploading logs during build
+  org: process.env.SENTRY_ORG,
+  project: process.env.SENTRY_PROJECT,
+
+  // For all available options, see:
+  // https://github.com/getsentry/sentry-webpack-plugin#options
+
+  // Only upload source maps in production
+  widenClientFileUpload: true,
+
+  // Hides source maps from generated client bundles
+  hideSourceMaps: true,
+
+  // Automatically tree-shake Sentry logger statements to reduce bundle size
+  disableLogger: true,
+}
+
+// Make sure adding Sentry options is the last code to run before exporting
+export default process.env.NEXT_PUBLIC_SENTRY_DSN
+  ? withSentryConfig(nextConfig, sentryWebpackPluginOptions)
+  : nextConfig;

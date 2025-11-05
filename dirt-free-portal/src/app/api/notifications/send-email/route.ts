@@ -1,0 +1,190 @@
+export const dynamic = 'force-dynamic'
+
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { sendEmail } from '@/lib/email/send'
+import { emailTemplates } from '@/lib/email/templates'
+import { format } from 'date-fns'
+import { emailLimiter } from '@/lib/rate-limit'
+
+/**
+ * Send Email Notification
+ *
+ * Sends an email notification to a customer.
+ *
+ * Authentication: Required
+ * Rate Limit: 5 requests per minute per customer
+ *
+ * Request Body:
+ * {
+ *   type: string,  // Notification type
+ *   data: object   // Type-specific data
+ * }
+ *
+ * Supported Notification Types:
+ * - appointment_confirmed: { customerId, jobId }
+ * - appointment_reminder: { customerId, jobId, hoursUntil }
+ * - invoice_created: { customerId, invoiceId }
+ * - message_reply: { customerId, subject, staffName, replyText, messageId }
+ *
+ * Response (Success 200):
+ * { success: true }
+ *
+ * Error Responses:
+ * - 404: Customer not found
+ * - 400: Invalid notification type
+ * - 429: Too many email requests (rate limit exceeded)
+ * - 500: Failed to generate email / Failed to send email
+ *
+ * Example Usage:
+ * POST /api/notifications/send-email
+ * Body: { "type": "appointment_confirmed", "data": { "customerId": "uuid", "jobId": "uuid" } }
+ */
+export async function POST(request: Request) {
+  try {
+    const body = await request.json()
+    const { type, data } = body
+
+    const supabase = await createClient()
+
+    // Verify customer exists and get their email
+    const { data: customer, error: customerError } = await supabase
+      .from('customers')
+      .select('name, email')
+      .eq('id', data.customerId)
+      .single()
+
+    if (customerError || !customer) {
+      return NextResponse.json(
+        { error: 'Customer not found' },
+        { status: 404 }
+      )
+    }
+
+    // Rate limiting - 5 emails per minute per customer
+    // Strict limit to prevent email spam and protect sender reputation
+    try {
+      await emailLimiter.check(5, data.customerId)
+    } catch {
+      return NextResponse.json(
+        { error: 'Too many email requests. Please try again later.' },
+        { status: 429 }
+      )
+    }
+
+    let emailData: { subject: string; html: string } | null = null
+
+    switch (type) {
+      case 'appointment_confirmed': {
+        // Fetch job details
+        const { data: job } = await supabase
+          .from('jobs')
+          .select('scheduled_date, scheduled_time, services, address')
+          .eq('id', data.jobId)
+          .single()
+
+        if (job) {
+          emailData = emailTemplates.appointmentConfirmation({
+            customerName: customer.name,
+            serviceDate: job.scheduled_date || 'TBD',
+            serviceTime: job.scheduled_time || 'TBD',
+            services: job.services || [],
+            address: job.address || '',
+          })
+        }
+        break
+      }
+
+      case 'appointment_reminder': {
+        // Fetch job details
+        const { data: job } = await supabase
+          .from('jobs')
+          .select('scheduled_date, scheduled_time, services, address')
+          .eq('id', data.jobId)
+          .single()
+
+        if (job) {
+          emailData = emailTemplates.appointmentReminder({
+            customerName: customer.name,
+            serviceDate: job.scheduled_date || 'TBD',
+            serviceTime: job.scheduled_time || 'TBD',
+            services: job.services || [],
+            address: job.address || '',
+            hoursUntil: data.hoursUntil || 24,
+          })
+        }
+        break
+      }
+
+      case 'invoice_created': {
+        // Fetch invoice details
+        const { data: invoice } = await supabase
+          .from('invoices')
+          .select('invoice_number, total, due_date, job_id, jobs(services)')
+          .eq('id', data.invoiceId)
+          .single()
+
+        if (invoice) {
+          emailData = emailTemplates.invoiceCreated({
+            customerName: customer.name,
+            invoiceNumber: invoice.invoice_number,
+            amount: invoice.total,
+            dueDate: invoice.due_date
+              ? format(new Date(invoice.due_date), 'MMM d, yyyy')
+              : 'Upon receipt',
+            services: invoice.jobs?.services || [],
+            invoiceId: data.invoiceId,
+          })
+        }
+        break
+      }
+
+      case 'message_reply': {
+        emailData = emailTemplates.messageReply({
+          customerName: customer.name,
+          subject: data.subject,
+          staffName: data.staffName,
+          replyText: data.replyText,
+          messageId: data.messageId,
+        })
+        break
+      }
+
+      default:
+        return NextResponse.json(
+          { error: 'Invalid notification type' },
+          { status: 400 }
+        )
+    }
+
+    if (!emailData) {
+      return NextResponse.json(
+        { error: 'Failed to generate email' },
+        { status: 500 }
+      )
+    }
+
+    // Send the email
+    const result = await sendEmail({
+      to: customer.email,
+      subject: emailData.subject,
+      html: emailData.html,
+    })
+
+    if (!result.success) {
+      console.error('Email send failed:', result.error)
+      return NextResponse.json(
+        { error: 'Failed to send email' },
+        { status: 500 }
+      )
+    }
+
+    return NextResponse.json({ success: true })
+  } catch (error: any) {
+    console.error('Email notification error:', error)
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    )
+  }
+}
